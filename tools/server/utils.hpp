@@ -430,6 +430,10 @@ static std::string gen_tool_call_id() {
     return random_string();
 }
 
+static std::string gen_anthropic_msgid() {
+    return "msg_" + random_string();
+}
+
 //
 // other common utils
 //
@@ -470,6 +474,22 @@ static bool server_sent_event(httplib::DataSink & sink, const json & data) {
     LOG_DBG("data stream, to_send: %s", str.c_str());
 
     return sink.write(str.c_str(), str.size());
+}
+
+static bool server_sent_event_anthropic(httplib::DataSink & sink, const json & event) {
+    if (!event.is_object()) {
+        return false;
+    }
+    const std::string name = event.value("event", std::string());
+    const json & payload = event.contains("data") ? event.at("data") : json::object();
+
+    std::string record;
+    if (!name.empty()) {
+        record += "event: " + name + "\n";
+    }
+    record += "data: " + payload.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+    LOG_DBG("anthropic stream, to_send: %s", record.c_str());
+    return sink.write(record.c_str(), record.size());
 }
 
 //
@@ -522,6 +542,17 @@ static json oaicompat_completion_params_parse(const json & body) {
 }
 
 struct oaicompat_parser_options {
+    bool use_jinja;
+    bool prefill_assistant;
+    common_reasoning_format reasoning_format;
+    std::map<std::string,std::string> chat_template_kwargs;
+    common_chat_templates * tmpls;
+    bool allow_image;
+    bool allow_audio;
+    bool enable_thinking = true;
+};
+
+struct anthropic_parser_options {
     bool use_jinja;
     bool prefill_assistant;
     common_reasoning_format reasoning_format;
@@ -801,6 +832,168 @@ static json oaicompat_chat_params_parse(
             llama_params[item.key()] = item.value();
         }
     }
+
+    return llama_params;
+}
+
+static json anthropic_messages_params_parse(
+    json & body,
+    const anthropic_parser_options & opt,
+    std::vector<raw_buffer> & out_files)
+{
+    json llama_params;
+
+    if (body.contains("stop_sequences")) {
+        const auto & stop_sequences = body.at("stop_sequences");
+        if (stop_sequences.is_null()) {
+            llama_params["stop"] = json::array();
+        } else if (stop_sequences.is_string()) {
+            llama_params["stop"] = json::array({stop_sequences.get<std::string>()});
+        } else if (stop_sequences.is_array()) {
+            llama_params["stop"] = stop_sequences;
+        } else {
+            throw std::runtime_error("stop_sequences must be a string or array");
+        }
+    } else {
+        llama_params["stop"] = json::array();
+    }
+
+    auto tools = json_value(body, "tools", json::array());
+    bool has_tools = tools.is_array() && !tools.empty();
+    auto stream = json_value(body, "stream", false);
+
+    if (!opt.use_jinja && has_tools) {
+        throw std::runtime_error("tools param requires --jinja flag");
+    }
+
+    auto tool_choice_value = json_value(body, "tool_choice", json());
+    common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    if (tool_choice_value.is_string()) {
+        const auto type = tool_choice_value.get<std::string>();
+        if (type == "auto") {
+            tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+        } else if (type == "none") {
+            tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        } else if (type == "any") {
+            tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        } else {
+            throw std::runtime_error("Unsupported tool_choice value: " + type);
+        }
+    } else if (tool_choice_value.is_object()) {
+        const auto type = json_value(tool_choice_value, "type", std::string("auto"));
+        if (type == "auto") {
+            tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+        } else if (type == "none") {
+            tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+        } else if (type == "any") {
+            tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        } else {
+            throw std::runtime_error("Unsupported tool_choice type: " + type);
+        }
+    } else if (!tool_choice_value.is_null()) {
+        throw std::runtime_error("tool_choice must be a string or object");
+    }
+
+    if (!body.contains("messages")) {
+        throw std::runtime_error("'messages' is required");
+    }
+    json & messages = body.at("messages");
+    json system = json_value(body, "system", json());
+
+    for (const auto & message : messages) {
+        if (message.contains("attachments") && !message.at("attachments").empty()) {
+            throw std::runtime_error("attachments are not supported");
+        }
+    }
+
+    common_chat_templates_inputs inputs;
+    inputs.messages              = common_chat_msgs_parse_anthropic(system, messages);
+    inputs.tools                 = common_chat_tools_parse_anthropic(tools);
+    inputs.tool_choice           = tool_choice;
+    inputs.use_jinja             = opt.use_jinja;
+    inputs.add_generation_prompt = json_value(body, "add_generation_prompt", true);
+    inputs.reasoning_format      = opt.reasoning_format;
+    inputs.enable_thinking       = opt.enable_thinking;
+
+    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        if (body.contains("grammar")) {
+            throw std::runtime_error("Cannot use custom grammar constraints with tools.");
+        }
+        llama_params["parse_tool_calls"] = true;
+    }
+
+    auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
+    inputs.chat_template_kwargs = opt.chat_template_kwargs;
+    for (const auto & item : chat_template_kwargs_object.items()) {
+        inputs.chat_template_kwargs[item.key()] = item.value().dump();
+    }
+
+    auto enable_thinking_kwarg = json_value(inputs.chat_template_kwargs, "enable_thinking", std::string(""));
+    if (enable_thinking_kwarg == "true") {
+        inputs.enable_thinking = true;
+    } else if (enable_thinking_kwarg == "false") {
+        inputs.enable_thinking = false;
+    } else if (!enable_thinking_kwarg.empty() && enable_thinking_kwarg[0] == '"') {
+        throw std::runtime_error("invalid type for \"enable_thinking\" (expected boolean, got string)");
+    }
+
+    bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
+    common_chat_msg last_message;
+    if (prefill_assistant_message) {
+        last_message = inputs.messages.back();
+        inputs.messages.pop_back();
+
+        if (!inputs.messages.empty() && inputs.messages.back().role == "assistant") {
+            throw std::runtime_error("Cannot have 2 or more assistant messages at the end of the list.");
+        }
+
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+        if (inputs.enable_thinking) {
+            throw std::runtime_error("Assistant response prefill is incompatible with enable_thinking.");
+        }
+
+        inputs.add_generation_prompt = true;
+    }
+
+    auto chat_params = common_chat_templates_apply(opt.tmpls, inputs);
+
+    if (prefill_assistant_message) {
+        if (!last_message.content_parts.empty()) {
+            for (auto & p : last_message.content_parts) {
+                chat_params.prompt += p.text;
+            }
+        } else {
+            chat_params.prompt += last_message.content;
+        }
+    }
+
+    llama_params["chat_format"]      = static_cast<int>(chat_params.format);
+    llama_params["prompt"]           = chat_params.prompt;
+    if (!chat_params.grammar.empty()) {
+        llama_params["grammar"] = chat_params.grammar;
+    }
+    llama_params["grammar_lazy"]     = chat_params.grammar_lazy;
+    auto grammar_triggers = json::array();
+    for (const auto & trigger : chat_params.grammar_triggers) {
+        server_grammar_trigger ct(trigger);
+        grammar_triggers.push_back(ct.to_json());
+    }
+    llama_params["grammar_triggers"] = grammar_triggers;
+    llama_params["preserved_tokens"] = chat_params.preserved_tokens;
+    llama_params["thinking_forced_open"] = chat_params.thinking_forced_open;
+    for (const auto & stop : chat_params.additional_stops) {
+        llama_params["stop"].push_back(stop);
+    }
+
+    for (const auto & item : body.items()) {
+        if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
+            llama_params[item.key()] = item.value();
+        }
+    }
+
+    (void) out_files;
+    (void) stream;
 
     return llama_params;
 }

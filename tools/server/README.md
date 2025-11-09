@@ -1279,6 +1279,34 @@ curl http://localhost:8080/v1/chat/completions \
 
 **See our [Function calling](../../docs/function-calling.md) docs** for more details, supported native tool call styles (generic tool call style is used as fallback) / examples of use.
 
+### POST `/v1/messages`: Anthropic-compatible Messages API
+
+This endpoint accepts requests following [Anthropic's Messages API](https://docs.anthropic.com/en/api/messages) schema. The server translates Anthropic `system` and `messages` blocks into the configured chat template and returns Anthropic-formatted responses. Both blocking and streaming modes are supported; in streaming mode, the server emits SSE events such as `message_start`, `content_block_delta`, `message_delta`, and `message_stop`.
+
+*Highlights:*
+
+* Supports `system`, `messages`, `stop_sequences`, and `max_tokens` fields from the Messages API.
+* Tool definitions provided under `tools` are converted to llama.cpp tool grammars when the server runs with `--jinja`.
+* Authentication via either `Authorization: Bearer …` or `x-api-key` headers is accepted when API keys are configured.
+
+*Example:*
+
+```shell
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: demo-key" \
+  -d '{
+    "model": "claude-3-sonnet",  
+    "max_tokens": 64,
+    "system": "You are a concise assistant.",
+    "messages": [
+      {"role": "user", "content": [{"type": "text", "text": "List three colors."}]}
+    ]
+  }'
+```
+
+Streaming responses can be requested with `"stream": true`; the server will emit Anthropic-style SSE events until a final `message_stop` event is sent.
+
 *Timings and context usage*
 
 The response contains a `timings` object, for example:

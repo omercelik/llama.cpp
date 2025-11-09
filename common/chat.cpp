@@ -46,6 +46,146 @@ static std::string string_diff(const std::string & last, const std::string & cur
     return current.substr(last.size());
 }
 
+static std::string anthropic_collect_text(const json & content) {
+    if (content.is_null()) {
+        return "";
+    }
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (content.is_array()) {
+        std::string text;
+        for (const auto & part : content) {
+            if (part.is_string()) {
+                text += part.get<std::string>();
+                continue;
+            }
+            if (!part.is_object()) {
+                throw std::runtime_error("Unsupported Anthropic content part: " + part.dump());
+            }
+            auto type = part.value("type", std::string());
+            if (type != "text") {
+                throw std::runtime_error("Unsupported Anthropic content part type: " + part.dump());
+            }
+            text += part.value("text", std::string());
+        }
+        return text;
+    }
+    throw std::runtime_error("Invalid Anthropic content value: " + content.dump());
+}
+
+static void anthropic_append_text_part(common_chat_msg & msg, const std::string & text) {
+    if (text.empty()) {
+        return;
+    }
+    common_chat_msg_content_part part;
+    part.type = "text";
+    part.text = text;
+    msg.content_parts.push_back(std::move(part));
+}
+
+static std::vector<common_chat_msg> anthropic_message_to_common(const json & message) {
+    if (!message.is_object()) {
+        throw std::runtime_error("Expected message object, got " + message.dump());
+    }
+    if (!message.contains("role")) {
+        throw std::runtime_error("Missing role in message: " + message.dump());
+    }
+    const auto role = message.at("role").get<std::string>();
+    if (!message.contains("content")) {
+        throw std::runtime_error("Missing content in message: " + message.dump());
+    }
+
+    std::vector<common_chat_msg> outputs;
+
+    auto reset_current = [&]() {
+        common_chat_msg msg;
+        msg.role = role;
+        return msg;
+    };
+
+    common_chat_msg current = reset_current();
+
+    auto flush_current = [&]() {
+        if (!current.empty()) {
+            outputs.push_back(current);
+        }
+        current = reset_current();
+    };
+
+    auto handle_tool_result = [&](const json & block) {
+        flush_current();
+        common_chat_msg tool_msg;
+        tool_msg.role = "tool";
+        if (block.contains("tool_use_id")) {
+            tool_msg.tool_call_id = block.at("tool_use_id").get<std::string>();
+        }
+        if (block.contains("content")) {
+            tool_msg.content = anthropic_collect_text(block.at("content"));
+        } else if (block.contains("text")) {
+            tool_msg.content = block.at("text").get<std::string>();
+        }
+        if (block.value("is_error", false)) {
+            tool_msg.tool_name = "error";
+        }
+        if (!tool_msg.empty()) {
+            outputs.push_back(std::move(tool_msg));
+        }
+    };
+
+    const json & content = message.at("content");
+    if (content.is_string()) {
+        current.content = content.get<std::string>();
+        flush_current();
+    } else if (content.is_array()) {
+        for (const auto & block : content) {
+            if (block.is_string()) {
+                anthropic_append_text_part(current, block.get<std::string>());
+                continue;
+            }
+            if (!block.is_object()) {
+                throw std::runtime_error("Invalid Anthropic content block: " + block.dump());
+            }
+            const auto type = block.value("type", std::string());
+            if (type == "text") {
+                anthropic_append_text_part(current, block.value("text", std::string()));
+            } else if (type == "tool_use") {
+                common_chat_tool_call tc;
+                if (!block.contains("name")) {
+                    throw std::runtime_error("tool_use block missing name: " + block.dump());
+                }
+                tc.name = block.at("name").get<std::string>();
+                if (block.contains("input")) {
+                    tc.arguments = block.at("input").dump();
+                } else {
+                    tc.arguments = "{}";
+                }
+                if (block.contains("id")) {
+                    tc.id = block.at("id").get<std::string>();
+                }
+                current.tool_calls.push_back(std::move(tc));
+            } else if (type == "tool_result") {
+                handle_tool_result(block);
+            } else {
+                throw std::runtime_error("Unsupported Anthropic content block type: " + block.dump());
+            }
+        }
+        flush_current();
+    } else if (content.is_object()) {
+        // Treat a single block as an array of one element
+        auto nested = json::array({content});
+        auto converted = anthropic_message_to_common({{"role", role}, {"content", nested}});
+        outputs.insert(outputs.end(), converted.begin(), converted.end());
+        return outputs;
+    } else if (content.is_null()) {
+        flush_current();
+    } else {
+        throw std::runtime_error("Invalid Anthropic content: " + content.dump());
+    }
+
+    return outputs;
+}
+
 static bool has_content_or_tool_calls(const common_chat_msg & msg) {
     return !msg.content.empty() || !msg.tool_calls.empty();
 }
@@ -385,6 +525,72 @@ std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const json & too
 template <>
 std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const std::string & tools) {
     return common_chat_tools_parse_oaicompat(json::parse(tools));
+}
+
+std::vector<common_chat_msg> common_chat_msgs_parse_anthropic(
+        const json & system,
+        const json & messages) {
+    std::vector<common_chat_msg> result;
+
+    try {
+        if (!system.is_null()) {
+            json system_message = {
+                {"role", "system"},
+                {"content", system},
+            };
+            auto sys_msgs = anthropic_message_to_common(system_message);
+            result.insert(result.end(), sys_msgs.begin(), sys_msgs.end());
+        }
+
+        if (!messages.is_array()) {
+            throw std::runtime_error("Expected 'messages' to be an array, got " + messages.dump());
+        }
+
+        for (const auto & message : messages) {
+            auto converted = anthropic_message_to_common(message);
+            result.insert(result.end(), converted.begin(), converted.end());
+        }
+    } catch (const std::exception & e) {
+        throw std::runtime_error("Failed to parse Anthropic messages: " + std::string(e.what()));
+    }
+
+    return result;
+}
+
+std::vector<common_chat_tool> common_chat_tools_parse_anthropic(const json & tools) {
+    std::vector<common_chat_tool> result;
+
+    if (tools.is_null()) {
+        return result;
+    }
+
+    if (!tools.is_array()) {
+        throw std::runtime_error("Anthropic tools must be an array");
+    }
+
+    try {
+        for (const auto & tool : tools) {
+            if (!tool.is_object()) {
+                throw std::runtime_error("Invalid tool definition: " + tool.dump());
+            }
+            common_chat_tool parsed;
+            if (!tool.contains("name")) {
+                throw std::runtime_error("Tool definition missing name: " + tool.dump());
+            }
+            parsed.name = tool.at("name").get<std::string>();
+            parsed.description = tool.value("description", std::string());
+            if (tool.contains("input_schema")) {
+                parsed.parameters = tool.at("input_schema").dump();
+            } else {
+                parsed.parameters = json::object().dump();
+            }
+            result.push_back(std::move(parsed));
+        }
+    } catch (const std::exception & e) {
+        throw std::runtime_error("Failed to parse Anthropic tools: " + std::string(e.what()));
+    }
+
+    return result;
 }
 
 template <>

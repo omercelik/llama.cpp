@@ -3,6 +3,8 @@
 
 # type: ignore[reportUnusedImport]
 
+from __future__ import annotations
+
 import subprocess
 import os
 import re
@@ -10,6 +12,7 @@ import json
 import sys
 import requests
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import (
     Any,
@@ -117,9 +120,9 @@ class ServerProcess:
         elif "LLAMA_SERVER_BIN_PATH" in os.environ:
             server_path = os.environ["LLAMA_SERVER_BIN_PATH"]
         elif os.name == "nt":
-            server_path = "../../../build/bin/Release/llama-server.exe"
+            server_path = Path(__file__).resolve().parents[3] / "build/bin/Release/llama-server.exe"
         else:
-            server_path = "../../../build/bin/llama-server"
+            server_path = Path(__file__).resolve().parents[3] / "build/bin/llama-server"
         server_args = [
             "--host",
             self.server_host,
@@ -216,6 +219,10 @@ class ServerProcess:
         if self.mmproj_url:
             server_args.extend(["--mmproj-url", self.mmproj_url])
 
+        server_path = Path(server_path)
+        if not server_path.is_file():
+            raise FileNotFoundError(f"Could not find llama-server binary at '{server_path}'")
+
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
 
@@ -308,12 +315,21 @@ class ServerProcess:
             raise ValueError(f"Unimplemented method: {method}")
         if response.status_code != 200:
             raise ServerError(response.status_code, response.json())
+        current_event: Optional[str] = None
         for line_bytes in response.iter_lines():
             line = line_bytes.decode("utf-8")
+            if line.startswith('event: '):
+                current_event = line[len('event: '):]
+                continue
+            if line.startswith(':'):
+                continue
             if '[DONE]' in line:
                 break
             elif line.startswith('data: '):
                 data = json.loads(line[6:])
+                if current_event:
+                    data['event'] = current_event
+                current_event = None
                 print("Partial response from server", json.dumps(data, indent=2))
                 yield data
 

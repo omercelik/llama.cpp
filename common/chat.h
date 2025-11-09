@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common.h"
+#include <nlohmann/json.hpp>
 #include <functional>
 #include <chrono>
 #include <string>
@@ -216,3 +217,8 @@ template <class T> std::vector<common_chat_tool> common_chat_tools_parse_oaicomp
 template <class T> T common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & tools);
 
 template <class T> T common_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff);
+
+std::vector<common_chat_msg> common_chat_msgs_parse_anthropic(
+    const nlohmann::ordered_json & system,
+    const nlohmann::ordered_json & messages);
+std::vector<common_chat_tool> common_chat_tools_parse_anthropic(const nlohmann::ordered_json & tools);
