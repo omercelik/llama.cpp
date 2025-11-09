@@ -74,6 +74,7 @@ enum oaicompat_type {
     OAICOMPAT_TYPE_CHAT,
     OAICOMPAT_TYPE_COMPLETION,
     OAICOMPAT_TYPE_EMBEDDING,
+    OAICOMPAT_TYPE_ANTHROPIC_MESSAGES,
 };
 
 // https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11
@@ -770,6 +771,90 @@ struct completion_token_output {
     }
 };
 
+static json anthropic_make_event(const std::string & name, json data) {
+    return json {
+        {"event", name},
+        {"data",  std::move(data)},
+    };
+}
+
+static json anthropic_usage_json(int32_t input_tokens, int32_t output_tokens) {
+    return json {
+        {"input_tokens",  input_tokens},
+        {"output_tokens", output_tokens},
+    };
+}
+
+static json anthropic_tool_block_from_call(const common_chat_tool_call & call) {
+    json block = {
+        {"type", "tool_use"},
+        {"name", call.name},
+        {"id",   call.id},
+    };
+    if (call.arguments.empty()) {
+        block["input"] = json::object();
+    } else {
+        try {
+            block["input"] = json::parse(call.arguments);
+        } catch (const std::exception &) {
+            block["input"] = call.arguments;
+        }
+    }
+    return block;
+}
+
+static json anthropic_text_block(const std::string & text) {
+    return json {{"type", "text"}, {"text", text}};
+}
+
+static bool anthropic_has_text(const common_chat_msg & msg) {
+    return !msg.content.empty() || !msg.content_parts.empty() || !msg.reasoning_content.empty();
+}
+
+static json anthropic_content_from_msg(const common_chat_msg & msg) {
+    json content = json::array();
+    if (!msg.reasoning_content.empty()) {
+        content.push_back(anthropic_text_block(msg.reasoning_content));
+    }
+    if (!msg.content_parts.empty()) {
+        for (const auto & part : msg.content_parts) {
+            if (part.type != "text") {
+                throw std::runtime_error("Unsupported Anthropic content part type: " + part.type);
+            }
+            content.push_back(anthropic_text_block(part.text));
+        }
+    } else if (!msg.content.empty()) {
+        content.push_back(anthropic_text_block(msg.content));
+    }
+    for (const auto & call : msg.tool_calls) {
+        json block = anthropic_tool_block_from_call(call);
+        content.push_back(std::move(block));
+    }
+    return content;
+}
+
+static std::string anthropic_stop_reason(stop_type stop, const common_chat_msg & msg) {
+    switch (stop) {
+        case STOP_TYPE_LIMIT:
+            return "max_tokens";
+        case STOP_TYPE_WORD:
+        case STOP_TYPE_EOS:
+            return msg.tool_calls.empty() ? "end_turn" : "tool_use";
+        default:
+            return msg.tool_calls.empty() ? std::string() : "tool_use";
+    }
+}
+
+static common_chat_msg anthropic_resolve_msg(const common_chat_msg & msg, const std::string & fallback_content) {
+    if (!msg.empty()) {
+        return msg;
+    }
+    common_chat_msg resolved;
+    resolved.role = "assistant";
+    resolved.content = fallback_content;
+    return resolved;
+}
+
 struct server_task_result_cmpl_final : server_task_result {
     int index = 0;
 
@@ -820,6 +905,8 @@ struct server_task_result_cmpl_final : server_task_result {
                 return to_json_oaicompat();
             case OAICOMPAT_TYPE_CHAT:
                 return stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+            case OAICOMPAT_TYPE_ANTHROPIC_MESSAGES:
+                return stream ? to_json_anthropic_message_stream() : to_json_anthropic_message();
             default:
                 GGML_ASSERT(false && "Invalid oaicompat_type");
         }
@@ -1015,6 +1102,85 @@ struct server_task_result_cmpl_final : server_task_result {
 
         return deltas;
     }
+
+    json to_json_anthropic_message() {
+        auto msg = anthropic_resolve_msg(oaicompat_msg, content);
+        auto content_blocks = anthropic_content_from_msg(msg);
+        auto stop_reason_str = anthropic_stop_reason(stop, msg);
+        json stop_reason = stop_reason_str.empty() ? json(nullptr) : json(stop_reason_str);
+        json stop_sequence = (stop == STOP_TYPE_WORD && !stopping_word.empty()) ? json(stopping_word) : json(nullptr);
+
+        json res = {
+            {"id",            oaicompat_cmpl_id},
+            {"type",          "message"},
+            {"role",          "assistant"},
+            {"model",         oaicompat_model},
+            {"content",       std::move(content_blocks)},
+            {"stop_reason",   stop_reason},
+            {"stop_sequence", stop_sequence},
+            {"usage",         anthropic_usage_json(n_prompt_tokens, n_decoded)},
+        };
+
+        return res;
+    }
+
+    json to_json_anthropic_message_stream() {
+        json events = json::array();
+
+        for (const auto & diff : oaicompat_msg_diffs) {
+            if (diff.content_delta.empty()) {
+                continue;
+            }
+            json data = {
+                {"type",  "content_block_delta"},
+                {"index", 0},
+                {"delta", json{{"type", "text_delta"}, {"text", diff.content_delta}}},
+            };
+            events.push_back(anthropic_make_event("content_block_delta", std::move(data)));
+        }
+
+        auto msg = anthropic_resolve_msg(oaicompat_msg, content);
+        bool has_text = anthropic_has_text(msg);
+        if (has_text) {
+            json stop_data = {
+                {"type",  "content_block_stop"},
+                {"index", 0},
+            };
+            events.push_back(anthropic_make_event("content_block_stop", std::move(stop_data)));
+        }
+
+        size_t base_index = has_text ? 1 : 0;
+        for (size_t i = 0; i < msg.tool_calls.size(); ++i) {
+            json start_data = {
+                {"type", "content_block_start"},
+                {"index", base_index + i},
+                {"content_block", anthropic_tool_block_from_call(msg.tool_calls[i])},
+            };
+            events.push_back(anthropic_make_event("content_block_start", std::move(start_data)));
+
+            json stop_data = {
+                {"type",  "content_block_stop"},
+                {"index", base_index + i},
+            };
+            events.push_back(anthropic_make_event("content_block_stop", std::move(stop_data)));
+        }
+
+        auto stop_reason_str = anthropic_stop_reason(stop, msg);
+        json delta_body = json::object();
+        delta_body["stop_reason"] = stop_reason_str.empty() ? json(nullptr) : json(stop_reason_str);
+        delta_body["stop_sequence"] = (stop == STOP_TYPE_WORD && !stopping_word.empty()) ? json(stopping_word) : json(nullptr);
+
+        json message_delta = {
+            {"type",  "message_delta"},
+            {"delta", std::move(delta_body)},
+            {"usage", anthropic_usage_json(n_prompt_tokens, n_decoded)},
+        };
+        events.push_back(anthropic_make_event("message_delta", std::move(message_delta)));
+
+        events.push_back(anthropic_make_event("message_stop", json{{"type", "message_stop"}}));
+
+        return events;
+    }
 };
 
 struct server_task_result_cmpl_partial : server_task_result {
@@ -1055,6 +1221,8 @@ struct server_task_result_cmpl_partial : server_task_result {
                 return to_json_oaicompat();
             case OAICOMPAT_TYPE_CHAT:
                 return to_json_oaicompat_chat();
+            case OAICOMPAT_TYPE_ANTHROPIC_MESSAGES:
+                return to_json_anthropic_message_stream();
             default:
                 GGML_ASSERT(false && "Invalid oaicompat_type");
         }
@@ -1175,6 +1343,63 @@ struct server_task_result_cmpl_partial : server_task_result {
         }
 
         return deltas;
+    }
+
+    json to_json_anthropic_message_stream() {
+        json events = json::array();
+
+        if (is_progress) {
+            return events;
+        }
+
+        bool has_text_delta = false;
+        for (const auto & diff : oaicompat_msg_diffs) {
+            if (!diff.content_delta.empty()) {
+                has_text_delta = true;
+                break;
+            }
+        }
+
+        if (n_decoded == 1) {
+            json message_start = {
+                {"type", "message_start"},
+                {"message", json {
+                    {"id",            oaicompat_cmpl_id},
+                    {"type",          "message"},
+                    {"role",          "assistant"},
+                    {"model",         oaicompat_model},
+                    {"content",       json::array()},
+                    {"stop_reason",   nullptr},
+                    {"stop_sequence", nullptr},
+                }},
+            };
+            events.push_back(anthropic_make_event("message_start", std::move(message_start)));
+
+            if (has_text_delta) {
+                json block_start = {
+                    {"type", "content_block_start"},
+                    {"index", 0},
+                    {"content_block", anthropic_text_block("")},
+                };
+                events.push_back(anthropic_make_event("content_block_start", std::move(block_start)));
+            }
+        }
+
+        if (has_text_delta) {
+            for (const auto & diff : oaicompat_msg_diffs) {
+                if (diff.content_delta.empty()) {
+                    continue;
+                }
+                json delta = {
+                    {"type",  "content_block_delta"},
+                    {"index", 0},
+                    {"delta", json{{"type", "text_delta"}, {"text", diff.content_delta}}},
+                };
+                events.push_back(anthropic_make_event("content_block_delta", std::move(delta)));
+            }
+        }
+
+        return events;
     }
 };
 
@@ -2358,6 +2583,7 @@ struct server_context {
 
     common_chat_templates_ptr chat_templates;
     oaicompat_parser_options  oai_parser_opt;
+    anthropic_parser_options  anthropic_parser_opt;
 
     ~server_context() {
         mtmd_free(mctx);
@@ -2587,6 +2813,16 @@ struct server_context {
         SRV_INF("thinking = %d\n", enable_thinking);
 
         oai_parser_opt = {
+            /* use_jinja             */ params_base.use_jinja,
+            /* prefill_assistant     */ params_base.prefill_assistant,
+            /* reasoning_format      */ params_base.reasoning_format,
+            /* chat_template_kwargs  */ params_base.default_template_kwargs,
+            /* common_chat_templates */ chat_templates.get(),
+            /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
+            /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+            /* enable_thinking       */ enable_thinking,
+        };
+        anthropic_parser_opt = {
             /* use_jinja             */ params_base.use_jinja,
             /* prefill_assistant     */ params_base.prefill_assistant,
             /* reasoning_format      */ params_base.reasoning_format,
@@ -4579,14 +4815,29 @@ int main(int argc, char ** argv) {
         }
 
         // Check for API key in the header
+        auto is_valid_key = [&params](const std::string & candidate) {
+            if (candidate.empty()) {
+                return false;
+            }
+            return std::find(params.api_keys.begin(), params.api_keys.end(), candidate) != params.api_keys.end();
+        };
+
         auto auth_header = req.get_header_value("Authorization");
 
         std::string prefix = "Bearer ";
         if (auth_header.substr(0, prefix.size()) == prefix) {
             std::string received_api_key = auth_header.substr(prefix.size());
-            if (std::find(params.api_keys.begin(), params.api_keys.end(), received_api_key) != params.api_keys.end()) {
+            if (is_valid_key(received_api_key)) {
                 return true; // API key is valid
             }
+        }
+
+        std::string anthropic_key = req.get_header_value("x-api-key");
+        if (anthropic_key.empty()) {
+            anthropic_key = req.get_header_value("X-Api-Key");
+        }
+        if (is_valid_key(anthropic_key)) {
+            return true;
         }
 
         // API key is invalid or not provided
@@ -4997,7 +5248,12 @@ int main(int argc, char ** argv) {
             oaicompat_type oaicompat) -> void {
         GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
-        auto completion_id = gen_chatcmplid();
+        std::string completion_id;
+        if (oaicompat == OAICOMPAT_TYPE_ANTHROPIC_MESSAGES) {
+            completion_id = gen_anthropic_msgid();
+        } else {
+            completion_id = gen_chatcmplid();
+        }
         std::unordered_set<int> task_ids;
         try {
             std::vector<server_task> tasks;
@@ -5079,24 +5335,39 @@ int main(int argc, char ** argv) {
             const auto chunked_content_provider = [task_ids, &ctx_server, oaicompat](size_t, httplib::DataSink & sink) {
                 ctx_server.receive_cmpl_results_stream(task_ids, [&](server_task_result_ptr & result) -> bool {
                     json res_json = result->to_json();
-                    if (res_json.is_array()) {
-                        for (const auto & res : res_json) {
-                            if (!server_sent_event(sink, res)) {
-                                // sending failed (HTTP connection closed), cancel the generation
-                                return false;
+                    if (oaicompat == OAICOMPAT_TYPE_ANTHROPIC_MESSAGES) {
+                        if (res_json.is_array()) {
+                            for (const auto & res : res_json) {
+                                if (!server_sent_event_anthropic(sink, res)) {
+                                    return false;
+                                }
                             }
+                            return true;
                         }
-                        return true;
+                        return server_sent_event_anthropic(sink, res_json);
                     } else {
+                        if (res_json.is_array()) {
+                            for (const auto & res : res_json) {
+                                if (!server_sent_event(sink, res)) {
+                                    // sending failed (HTTP connection closed), cancel the generation
+                                    return false;
+                                }
+                            }
+                            return true;
+                        }
                         return server_sent_event(sink, res_json);
                     }
                 }, [&](const json & error_data) {
-                    server_sent_event(sink, json{{"error", error_data}});
+                    if (oaicompat == OAICOMPAT_TYPE_ANTHROPIC_MESSAGES) {
+                        server_sent_event_anthropic(sink, anthropic_make_event("error", json{{"type", "error"}, {"error", error_data}}));
+                    } else {
+                        server_sent_event(sink, json{{"error", error_data}});
+                    }
                 }, [&sink]() {
                     // note: do not use req.is_connection_closed here because req is already destroyed
                     return !sink.is_writable();
                 });
-                if (oaicompat != OAICOMPAT_TYPE_NONE) {
+                if (oaicompat == OAICOMPAT_TYPE_CHAT || oaicompat == OAICOMPAT_TYPE_COMPLETION) {
                     static const std::string ev_done = "data: [DONE]\n\n";
                     sink.write(ev_done.data(), ev_done.size());
                 }
@@ -5232,6 +5503,25 @@ int main(int argc, char ** argv) {
             req.is_connection_closed,
             res,
             OAICOMPAT_TYPE_CHAT);
+    };
+
+    const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        LOG_DBG("anthropic request: %s\n", req.body.c_str());
+
+        auto body = json::parse(req.body);
+        std::vector<raw_buffer> files;
+        json data = anthropic_messages_params_parse(
+            body,
+            ctx_server.anthropic_parser_opt,
+            files);
+
+        handle_completions_impl(
+            SERVER_TASK_TYPE_COMPLETION,
+            data,
+            files,
+            req.is_connection_closed,
+            res,
+            OAICOMPAT_TYPE_ANTHROPIC_MESSAGES);
     };
 
     // same with handle_chat_completions, but without inference part
@@ -5641,6 +5931,7 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/chat/completions",    handle_chat_completions);
     svr->Post(params.api_prefix + "/v1/chat/completions", handle_chat_completions);
     svr->Post(params.api_prefix + "/api/chat",            handle_chat_completions); // ollama specific endpoint
+    svr->Post(params.api_prefix + "/v1/messages",         handle_anthropic_messages);
     svr->Post(params.api_prefix + "/infill",              handle_infill);
     svr->Post(params.api_prefix + "/embedding",           handle_embeddings); // legacy
     svr->Post(params.api_prefix + "/embeddings",          handle_embeddings);
